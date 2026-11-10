@@ -196,6 +196,23 @@ def dataset_for_deepar(name, max_encoder_length = 10, batch_size = 64, scaler = 
     return training, train_dataloader, val_dataloader, test_dataloader, F
 
 
+def split_validation(X, Y):
+    """Use the first half of validation for tuning and the second for calibration."""
+
+    if Y is None: # DeepAR dataloader
+        dataset = X.dataset
+        index = dataset.decoded_index
+        midpoint = (index.time_idx_first_prediction.min() + index.time_idx_last.max() + 1) // 2
+        # Keep prediction windows entirely on one side of the boundary.
+        tuning = dataset.filter(lambda x: x.time_idx_last < midpoint)
+        calibration = dataset.filter(lambda x: x.time_idx_first_prediction >= midpoint)
+        return tuning.to_dataloader(train=False, batch_size=X.batch_size, num_workers=0), None, \
+                calibration.to_dataloader(train=False, batch_size=X.batch_size, num_workers=0), None
+
+    midpoint = len(X) // 2
+    return X[:midpoint], Y[:midpoint], X[midpoint:], Y[midpoint:]
+
+
 def to_torch(array, device):
     """
     Transform numpy arrays to torch tensors and move them to `device`

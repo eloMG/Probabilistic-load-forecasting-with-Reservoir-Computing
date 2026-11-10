@@ -3,6 +3,7 @@ import pmdarima
 import numpy as np
 
 from time import process_time
+from copy import deepcopy
 from tqdm import trange
 from inference.frequentist.utils import compute_coverage_len, calibrate, eval_crps
 from inference.early_stopping import EarlyStopping
@@ -62,17 +63,16 @@ def train_QR(model, X, Y, X_val, Y_val, lr, epochs, quantiles):
     return diagnostics
 
 
-def pred_QR(model, X_val, Y_val, X_test, Y_test, plot, sweep, diagnostics, quantiles):
+def pred_QR(model, X_val, Y_val, X_cal, Y_cal, X_test, Y_test, plot, sweep, diagnostics, quantiles):
 
     model.eval()
 
     # Use validation set for hyperparameters tuning
     if sweep:
         X, Y = X_val, Y_val
-        X2, Y2 = X_test, Y_test
     else:
         X, Y = X_test, Y_test
-        X2, Y2 = X_val, Y_val
+    X2, Y2 = X_cal, Y_cal
 
     # Perform inference
     start_time = process_time()
@@ -81,10 +81,12 @@ def pred_QR(model, X_val, Y_val, X_test, Y_test, plot, sweep, diagnostics, quant
     diagnostics["inference_time"] = inference_time
 
     # Compute calibration error
-    predictive2 = model(X2).detach().squeeze()
+    predictive2 = None
+    if not sweep:
+        predictive2 = model(X2).detach().squeeze()
     # Calibrate
     # calibration doesn't make sense for QR
-    cal_error, new_cal_error, new_quantiles = calibrate(predictive, predictive2, Y, Y2, quantiles, folder="q_regr", plot=plot)
+    cal_error, new_cal_error, new_quantiles = calibrate(predictive, predictive2, Y, Y2, quantiles, folder="q_regr", plot=plot, recalibrate=not sweep)
     diagnostics["cal_error"] = cal_error
     diagnostics["new_cal_error"] = new_cal_error    # it does not refer to same quantiles
     diagnostics["quantiles"] = quantiles
@@ -165,16 +167,21 @@ def train_ARIMA(X, start_p=1, start_q=1, max_p=4, max_q=4, d=1):
     return arima_model, diagnostics
 
 
-def pred_ARIMA(model, X_val, Y_val, X_test, Y_test, horizon, plot, diagnostics, quantiles):
+def pred_ARIMA(model, X_val, Y_val, X_cal, Y_cal, X_test, Y_test, horizon, plot, sweep, diagnostics, quantiles):
 
     # Make predictions and update the model
     q_lows, q_highs = [], []
 
     start_time = process_time()
 
-    X = torch.cat([X_val, X_test])
+    if sweep:
+        X, Y = X_val, Y_val
+    else:
+        X, Y = torch.cat([X_val, X_cal, X_test]), Y_test
 
+    fitted_model = model
     for q1, q2 in zip(quantiles[1:len(quantiles)//2], quantiles[::-1]):
+        model = deepcopy(fitted_model) # restart before each chronological pass
         pred_list, ci_list = [], []
         with trange(X.shape[0], desc = "CI {0:.2f}".format(q2-q1)) as t:
             for step in t:
@@ -198,12 +205,17 @@ def pred_ARIMA(model, X_val, Y_val, X_test, Y_test, horizon, plot, diagnostics, 
     q_highs = np.vstack(q_highs).T
 
     predictive = np.hstack([q_lows, preds[:,None], q_highs])
-    predictive2 = torch.from_numpy(predictive[X_val.shape[0]:,:]) # corresponding to test set
-    predictive = torch.from_numpy(predictive[:X_val.shape[0],:])  # corresponding to val test
+    predictive2 = None
+    if not sweep:
+        cal_start = X_val.shape[0]
+        test_start = cal_start + X_cal.shape[0]
+        predictive2 = torch.from_numpy(predictive[cal_start:test_start,:])
+        predictive = predictive[test_start:,:]
+    predictive = torch.from_numpy(predictive)
 
     # Compute calibration error
     # Calibrate
-    cal_error, new_cal_error, new_quantiles = calibrate(predictive, predictive2, Y_val, Y_test, quantiles[1:], folder="arima", plot=plot)
+    cal_error, new_cal_error, new_quantiles = calibrate(predictive, predictive2, Y, Y_cal, quantiles[1:], folder="arima", plot=plot, recalibrate=not sweep)
     diagnostics["cal_error"] = cal_error
     diagnostics["new_cal_error"] = new_cal_error    # it does not refer to same quantiles
     diagnostics["quantiles"] = quantiles[1:]
@@ -218,7 +230,7 @@ def pred_ARIMA(model, X_val, Y_val, X_test, Y_test, horizon, plot, diagnostics, 
 
     # Check coverage with 95% quantiles
     if predictive.dim() > 1:
-        coverage, avg_length = compute_coverage_len(Y_val.cpu().numpy(), q_low, q_hi)
+        coverage, avg_length = compute_coverage_len(Y.cpu().numpy(), q_low, q_hi)
         diagnostics["coverage"] = coverage
         diagnostics["avg_length"] = avg_length
         # After calibration it does not refer to same quantiles
@@ -228,13 +240,13 @@ def pred_ARIMA(model, X_val, Y_val, X_test, Y_test, horizon, plot, diagnostics, 
     # Mean Squared Error wrt the median
     mean_index = int(predictive.shape[1]/2)
     median = predictive[:,mean_index].cpu().numpy()
-    mse = np.mean((median-Y_val.cpu().numpy())**2)
+    mse = np.mean((median-Y.cpu().numpy())**2)
     diagnostics["mse"] = mse
     # After calibration it does not refer to the median
     diagnostics["new_mse"] = float('nan')
 
     # Continuous ranked probability score
-    crps = eval_crps(quantiles[1:], predictive.cpu().numpy(), Y_val.unsqueeze(dim=1).cpu().numpy())
+    crps = eval_crps(quantiles[1:], predictive.cpu().numpy(), Y.unsqueeze(dim=1).cpu().numpy())
     diagnostics["crps"] = crps
     # After calibration it does not refer to same quantiles
     diagnostics["new_crps"] = float('nan')

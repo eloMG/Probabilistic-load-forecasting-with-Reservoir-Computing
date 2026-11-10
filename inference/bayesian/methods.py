@@ -55,15 +55,14 @@ def train_SVI(model, guide, X, Y, lr=0.03, num_iterations=120):
     return diagnostics
 
 
-def pred_SVI(model, guide, X_val, Y_val, X_test, Y_test, num_samples, plot, sweep, diagnostics, quantiles):
+def pred_SVI(model, guide, X_val, Y_val, X_cal, Y_cal, X_test, Y_test, num_samples, plot, sweep, diagnostics, quantiles):
 
     # Use validation set for hyperparameters tuning
     if sweep:
         X, Y = X_val, Y_val
-        X2, Y2 = X_test, Y_test
     else:
         X, Y = X_test, Y_test
-        X2, Y2 = X_val, Y_val
+    X2, Y2 = X_cal, Y_cal
 
     # Perform inference
     start_time = process_time()
@@ -72,11 +71,13 @@ def pred_SVI(model, guide, X_val, Y_val, X_test, Y_test, num_samples, plot, swee
     diagnostics["inference_time"] = inference_time
 
     # Compute calibration error
-    predictive2 = Predictive(model, guide=guide, num_samples=num_samples)(x=X2, y=None)
+    predictive2 = None
+    if not sweep:
+        predictive2 = Predictive(model, guide=guide, num_samples=num_samples)(x=X2, y=None)["obs"].cpu().numpy().squeeze()
     # Calibrate
     cal_error, new_cal_error, new_quantiles = calibrate(predictive["obs"].cpu().numpy().squeeze(), 
-                                                        predictive2["obs"].cpu().numpy().squeeze(), 
-                                                        Y, Y2, quantiles, folder="svi", plot=plot)
+                                                        predictive2,
+                                                        Y, Y2, quantiles, folder="svi", plot=plot, recalibrate=not sweep)
     diagnostics["cal_error"] = cal_error
     diagnostics["new_cal_error"] = new_cal_error
     diagnostics["quantiles"] = quantiles
@@ -181,15 +182,14 @@ def train_MCMC(model, X, Y, num_chains, num_samples, sweep):
     return samples, diagnostics
 
 
-def pred_MCMC(model, samples, X_val, Y_val, X_test, Y_test, plot, sweep, diagnostics, inference_name, quantiles):
+def pred_MCMC(model, samples, X_val, Y_val, X_cal, Y_cal, X_test, Y_test, plot, sweep, diagnostics, inference_name, quantiles):
 
     # Use validation set for hyperparameters tuning
     if sweep:
         X, Y = X_val, Y_val
-        X2, Y2 = X_test, Y_test
     else:
         X, Y = X_test, Y_test
-        X2, Y2 = X_val, Y_val
+    X2, Y2 = X_cal, Y_cal
 
     # Find when it converged
     acc_rate = diagnostics["acceptance_rate"]
@@ -217,11 +217,13 @@ def pred_MCMC(model, samples, X_val, Y_val, X_test, Y_test, plot, sweep, diagnos
     diagnostics["mse"] = mse
 
     # Compute calibration error
-    predictive2 = Predictive(model, samples)(x=X2, y=None)
+    predictive2 = None
+    if not sweep:
+        predictive2 = Predictive(model, samples)(x=X2, y=None)["obs"].cpu().numpy().squeeze()
     # Calibrate
     cal_error, new_cal_error, new_quantiles = calibrate(predictive["obs"].cpu().numpy().squeeze(), 
-                                                        predictive2["obs"].cpu().numpy().squeeze(), 
-                                                        Y, Y2, quantiles, folder=inference_name, plot=plot)
+                                                        predictive2,
+                                                        Y, Y2, quantiles, folder=inference_name, plot=plot, recalibrate=not sweep)
     diagnostics["cal_error"] = cal_error
     diagnostics["new_cal_error"] = new_cal_error
     diagnostics["quantiles"] = quantiles
@@ -338,46 +340,54 @@ def estimate_DO_sigma(predictive, Y):
     return np.exp(result.x)
 
 
-def pred_DO(model, X_val, Y_val, X_test, Y_test, num_samples, plot, sweep, diagnostics, quantiles):
+def pred_DO(model, X_val, Y_val, X_cal, Y_cal, X_test, Y_test, num_samples, plot, sweep, diagnostics, quantiles):
 
     model.train() # keep dropout active during prediction
+
+    start_time = process_time()
+    val_predictive = []
+    with torch.no_grad():
+        for n in range(num_samples):
+            val_predictive.append(model(X_val).cpu().squeeze(-1).numpy())
+    val_predictive = np.stack(val_predictive, axis=0)
+    sigma = estimate_DO_sigma(val_predictive, Y_val)
+    diagnostics["sigma"] = sigma
+    diagnostics["aleatoric_variance"] = sigma**2
 
     # Use validation set for hyperparameters tuning
     if sweep:
         X, Y = X_val, Y_val
-        X2, Y2 = X_test, Y_test
     else:
         X, Y = X_test, Y_test
-        X2, Y2 = X_val, Y_val
+    X2, Y2 = X_cal, Y_cal
 
     # Perform inference
-    start_time = process_time()
-    predictive = []
-    with torch.no_grad():
-        for n in range(num_samples):
-            predictive.append(model(X).cpu().squeeze(-1).numpy())
-    predictive = np.stack(predictive, axis=0)
+    predictive = val_predictive
+    if not sweep:
+        predictive = []
+        with torch.no_grad():
+            for n in range(num_samples):
+                predictive.append(model(X).cpu().squeeze(-1).numpy())
+        predictive = np.stack(predictive, axis=0)
     inference_time = process_time() - start_time
     diagnostics["inference_time"] = inference_time
 
     # Compute calibration error
-    predictive2 = []
-    with torch.no_grad():
-        for n in range(num_samples):
-            predictive2.append(model(X2).cpu().squeeze(-1).numpy())
-    predictive2 = np.stack(predictive2, axis=0)
-
-    # Always fit observation noise on validation data, regardless of sweep.
-    sigma = estimate_DO_sigma(predictive if sweep else predictive2, Y_val)
-    diagnostics["sigma"] = sigma
-    diagnostics["aleatoric_variance"] = sigma**2
+    predictive2 = None
+    if not sweep:
+        predictive2 = []
+        with torch.no_grad():
+            for n in range(num_samples):
+                predictive2.append(model(X2).cpu().squeeze(-1).numpy())
+        predictive2 = np.stack(predictive2, axis=0)
 
     # Observation samples include both epistemic and aleatoric uncertainty.
     predictive = predictive + np.random.normal(0, sigma, size=predictive.shape)
-    predictive2 = predictive2 + np.random.normal(0, sigma, size=predictive2.shape)
+    if not sweep:
+        predictive2 = predictive2 + np.random.normal(0, sigma, size=predictive2.shape)
 
     # Calibrate
-    cal_error, new_cal_error, new_quantiles = calibrate(predictive, predictive2, Y, Y2, quantiles, folder="dropout", plot=plot)
+    cal_error, new_cal_error, new_quantiles = calibrate(predictive, predictive2, Y, Y2, quantiles, folder="dropout", plot=plot, recalibrate=not sweep)
     diagnostics["cal_error"] = cal_error
     diagnostics["new_cal_error"] = new_cal_error
     diagnostics["quantiles"] = quantiles
@@ -488,7 +498,7 @@ def train_deepAR(model, train_dataloader, val_dataloader, epochs, device):
     return best_model, diagnostics
     
 
-def pred_deepAR(model, val_dataloader, test_dataloader, num_samples, horizon, plot, sweep, diagnostics, quantiles, device):
+def pred_deepAR(model, val_dataloader, cal_dataloader, test_dataloader, num_samples, horizon, plot, sweep, diagnostics, quantiles, device):
     
     accelerator = "cuda" if device.type == "cuda" else "cpu"
     model = model.to(device)
@@ -496,10 +506,9 @@ def pred_deepAR(model, val_dataloader, test_dataloader, num_samples, horizon, pl
     # Use validation set for hyperparameters tuning
     if sweep:
         dataloader1 = val_dataloader
-        dataloader2 = test_dataloader
     else:
         dataloader1 = test_dataloader
-        dataloader2 = val_dataloader
+    dataloader2 = cal_dataloader
     
     # Perform inference
     start_time = process_time()
@@ -513,14 +522,16 @@ def pred_deepAR(model, val_dataloader, test_dataloader, num_samples, horizon, pl
     predictive_dict = {"obs": predictive, "y": Y}
 
     # Compute calibration error
-    predictive2 = model.predict(dataloader2, mode="raw", return_x=False, n_samples=num_samples, 
-                               trainer_kwargs=dict(accelerator=accelerator), return_y=True)
-    Y2 = predictive2.y[0][0,horizon-1::horizon]
-    predictive2 = predictive2.output["prediction"][:,-1,:].T
+    predictive2, Y2 = None, None
+    if not sweep:
+        predictive2 = model.predict(dataloader2, mode="raw", return_x=False, n_samples=num_samples,
+                                   trainer_kwargs=dict(accelerator=accelerator), return_y=True)
+        Y2 = predictive2.y[0][0,horizon-1::horizon]
+        predictive2 = predictive2.output["prediction"][:,-1,:].T.cpu().numpy().squeeze()
     # Calibrate
     cal_error, new_cal_error, new_quantiles = calibrate(predictive.cpu().numpy().squeeze(), 
-                                                        predictive2.cpu().numpy().squeeze(), 
-                                                        Y, Y2, quantiles, folder="deepar", plot=plot)
+                                                        predictive2,
+                                                        Y, Y2, quantiles, folder="deepar", plot=plot, recalibrate=not sweep)
     diagnostics["cal_error"] = cal_error
     diagnostics["new_cal_error"] = new_cal_error
     diagnostics["quantiles"] = quantiles
