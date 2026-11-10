@@ -107,6 +107,7 @@ widths, new_widths = [], []
 mses, new_mses = [], []
 coverages, new_coverages = [], []
 grs, effs = [], []
+sigmas, aleatoric_variances = [], []
 
 for s in range(config.seed):
     # Set seed for reproducibility
@@ -167,6 +168,10 @@ for s in range(config.seed):
     new_mses.append(diagnostics['new_mse'])
     coverages.append(diagnostics['coverage'])
     new_coverages.append(diagnostics['new_coverage'])
+
+    if config.inference == "dropout":
+        sigmas.append(diagnostics['sigma'])
+        aleatoric_variances.append(diagnostics['aleatoric_variance'])
 
     if "final_loss" in diagnostics.keys(): # MCMC doesn't have a loss
         losses.append(diagnostics['final_loss'])
@@ -246,6 +251,13 @@ wandb.log({"m_train_time": m_time,
            "eff_size": effs})
 
 
+if config.inference == "dropout":
+    wandb.log({"m_sigma": np.mean(sigmas),
+               "s_sigma": np.std(sigmas),
+               "m_aleatoric_variance": np.mean(aleatoric_variances),
+               "s_aleatoric_variance": np.std(aleatoric_variances)})
+
+
 if config.print_results:
     df = pd.DataFrame({"seed": range(config.seed), "train_times": train_times, "inf_times": inf_times,
                        "cal_errors": cal_errors, "new_cal_errors": new_cal_errors,
@@ -254,5 +266,8 @@ if config.print_results:
                        "MSE": mses, "new_MSE": new_mses,
                        "CRPS": crpss, "new_CRPS": new_crpss,
                        "final_loss": losses})
+    if config.inference == "dropout":
+        df["sigma"] = sigmas
+        df["aleatoric_variance"] = aleatoric_variances
     with pd.ExcelWriter(f"results/results.xlsx", mode="a", engine="openpyxl", if_sheet_exists="replace") as writer:
         df.to_excel(writer, sheet_name=f"sheet_{config.dataset}_{config.inference}", index=False) 

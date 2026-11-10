@@ -4,6 +4,8 @@ import numpy as np
 import lightning.pytorch as pl
 
 from time import process_time
+from scipy.optimize import minimize_scalar
+from scipy.special import logsumexp
 from pyro import clear_param_store
 from pyro.optim import Adam
 from pyro.infer import SVI, Trace_ELBO, Predictive, MCMC, NUTS
@@ -321,7 +323,24 @@ def train_DO(model, X, Y, X_val, Y_val, lr, epochs):
     return diagnostics
 
 
+def estimate_DO_sigma(predictive, Y):
+    """Fit Gaussian observation noise using fixed validation dropout predictions."""
+
+    squared_error = (Y.detach().cpu().numpy().reshape(-1) - predictive)**2
+
+    def neg_log_likelihood(log_sigma):
+        sigma = np.exp(log_sigma)
+        log_prob = -0.5 * squared_error / sigma**2 - log_sigma - 0.5 * np.log(2 * np.pi)
+        return -np.mean(logsumexp(log_prob, axis=0) - np.log(predictive.shape[0]))
+
+    # Targets are standardized; optimize log(sigma) to keep sigma positive.
+    result = minimize_scalar(neg_log_likelihood, bounds=(-10, 10), method="bounded")
+    return np.exp(result.x)
+
+
 def pred_DO(model, X_val, Y_val, X_test, Y_test, num_samples, plot, sweep, diagnostics, quantiles):
+
+    model.train() # keep dropout active during prediction
 
     # Use validation set for hyperparameters tuning
     if sweep:
@@ -334,17 +353,28 @@ def pred_DO(model, X_val, Y_val, X_test, Y_test, num_samples, plot, sweep, diagn
     # Perform inference
     start_time = process_time()
     predictive = []
-    for n in range(num_samples):
-        predictive.append(model(X).detach().cpu().squeeze())
+    with torch.no_grad():
+        for n in range(num_samples):
+            predictive.append(model(X).cpu().squeeze(-1).numpy())
     predictive = np.stack(predictive, axis=0)
     inference_time = process_time() - start_time
     diagnostics["inference_time"] = inference_time
 
     # Compute calibration error
     predictive2 = []
-    for n in range(num_samples):
-        predictive2.append(model(X2).detach().cpu().squeeze())
+    with torch.no_grad():
+        for n in range(num_samples):
+            predictive2.append(model(X2).cpu().squeeze(-1).numpy())
     predictive2 = np.stack(predictive2, axis=0)
+
+    # Always fit observation noise on validation data, regardless of sweep.
+    sigma = estimate_DO_sigma(predictive if sweep else predictive2, Y_val)
+    diagnostics["sigma"] = sigma
+    diagnostics["aleatoric_variance"] = sigma**2
+
+    # Observation samples include both epistemic and aleatoric uncertainty.
+    predictive = predictive + np.random.normal(0, sigma, size=predictive.shape)
+    predictive2 = predictive2 + np.random.normal(0, sigma, size=predictive2.shape)
 
     # Calibrate
     cal_error, new_cal_error, new_quantiles = calibrate(predictive, predictive2, Y, Y2, quantiles, folder="dropout", plot=plot)
