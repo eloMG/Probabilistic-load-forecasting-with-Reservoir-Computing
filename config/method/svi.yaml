@@ -1,0 +1,4 @@
+# @package _global_
+
+inference: svi
+esn: true

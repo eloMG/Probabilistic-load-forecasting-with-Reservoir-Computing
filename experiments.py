@@ -2,7 +2,7 @@ import pyro
 import torch
 import wandb
 import os
-import json
+import hydra
 import warnings
 
 import numpy as np
@@ -10,6 +10,7 @@ import pandas as pd
 
 from pyro.infer.autoguide import AutoMultivariateNormal, AutoLowRankMultivariateNormal, init_to_mean
 from pathlib import Path
+from omegaconf import DictConfig, OmegaConf
 from inference.bayesian.models import TorchModel, BayesianModel, HorseshoeSSVS
 from inference.inference import inference
 from ESN.utils import run_esn
@@ -19,255 +20,230 @@ from dataset.data_loaders import dataset_for_arima, dataset_for_deepar
 
 warnings.simplefilter("ignore", UserWarning)
 
-config = {
-            "dataset": "acea",
-            "model_widths": [512,1],
-            "activation": "relu",
-            "distributions": ["gauss", "unif", "gauss"],
-            "parameters": [[0,1],[0,1]],
-            "dim_reduction": False,
-            "dropout_p": 0.2,
-            "num_chains": 2,
-            "num_samples": 8000,
-            "inference": "deepar",
-            "lr": 0.03,
-            "num_iterations": 2000,
-            "low_rank": True,
-            "rank": None,
-            "plot": False,
-            "seed": 10,
-            "print_results": True,
-            "sweep": True,
-            "esn": False,
-            # config for ARIMA
-            "start_p": 1,
-            "start_q": 1,
-            "max_p": 32,
-            "max_q": 32,
-            "d": 1,
-            # config for deepAR
-            "hidden_size": 32,
-            "rnn_layers": 2,
-            "encoder": 10,
-            "batch": 64
-            }
+@hydra.main(version_base="1.3", config_path="config", config_name="config")
+def main(config: DictConfig):
+    os.environ["WANDB_MODE"]="online" if config['sweep'] else "offline"
+    wandb.init(project="bayes_rc", config=OmegaConf.to_container(config, resolve=True))
+    config = wandb.config
 
-os.environ["WANDB_MODE"]="online" if config['sweep'] else "offline"
-wandb.init(project="bayes_rc", config=config)
-config = wandb.config
+    # Select one GPU if more are available
+    os.environ["CUDA_VISIBLE_DEVICES"]='0'
 
-# Select one GPU if more are available
-os.environ["CUDA_VISIBLE_DEVICES"]='1'
-
-if torch.cuda.is_available():
-    device = torch.device('cuda')
-else:
-    device = torch.device('cpu')
-
-# Save/Load ESN state
-n_internal_units = json.load(open('ESN/configs/ESN_hyperparams.json', 'r'))['n_internal_units']
-save_path = './ESN/saved/' + f'{config.dataset}/dim_red_{config.dim_reduction}/'
-Path(save_path).mkdir(parents=True, exist_ok=True) # create folder if it does not exist
-file_path = save_path + f'esn_states_{n_internal_units}units.pt'
-
-if config.esn:
-    if os.path.isfile(file_path):
-        Ytr, train_embedding, Yval, val_embedding, Yte, test_embedding = torch.load(file_path, map_location=torch.device(device))
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
     else:
-        Ytr, train_embedding, Yval, val_embedding, Yte, test_embedding, _, _ = run_esn(config.dataset, device, dim_reduction=config.dim_reduction)
-        torch.save([Ytr, train_embedding, Yval, val_embedding, Yte, test_embedding], file_path)
-    horizon = None
-else:
-    # ARIMA
-    if config.inference == "arima":
         device = torch.device('cpu')
-        train_embedding, Ytr, val_embedding, Yval, test_embedding, Yte, _, _, horizon = dataset_for_arima(config.dataset, device)
-    # DeepAR
-    elif config.inference == "deepar":
-        training, train_embedding, val_embedding, test_embedding, horizon = dataset_for_deepar(config.dataset, config.encoder, config.batch)
-        Ytr, Yval, Yte = None, None, None
-    else:
-        raise ValueError(f"{config.inference} method not implemented.")
 
+    # Save/Load ESN state
+    n_internal_units = config.n_internal_units
+    save_path = './ESN/saved/' + f'{config.dataset}/dim_red_{config.dim_reduction}/'
+    Path(save_path).mkdir(parents=True, exist_ok=True) # create folder if it does not exist
+    file_path = save_path + f'esn_states_{n_internal_units}units.pt'
 
-# Quantiles
-quantiles = [0, 0.005]
-for n in range(39):
-    quantiles.append(0.025*(n+1))
-quantiles.append(0.995)
-
-
-train_times = []
-inf_times = []
-cal_errors, new_cal_errors = [], []
-e_crpss = []
-crpss, new_crpss = [], []
-losses = []
-widths, new_widths = [], []
-mses, new_mses = [], []
-coverages, new_coverages = [], []
-grs, effs = [], []
-sigmas, aleatoric_variances = [], []
-
-for s in range(config.seed):
-    # Set seed for reproducibility
-    pyro.set_rng_seed(s)
-    np.random.seed(s)
-
-    pyro.clear_param_store()
-
-    torch_model = TorchModel(config.model_widths, config.activation).to(device)
-    guide = None
-    if config.inference == "ssvs":
-        model = HorseshoeSSVS(config.activation, device=device)
-    elif config.inference == "q_regr":
-        model = TorchModel(config.model_widths, config.activation, quantiles=quantiles).to(device)
-    elif config.inference == "dropout":
-        model = TorchModel(config.model_widths, config.activation, dropout=True, p=config.dropout_p).to(device)
-    elif config.inference == "arima":
-        model = None
-    elif config.inference == "deepar":
-        model = DeepAR.from_dataset(
-            training,
-            learning_rate=config.lr,
-            hidden_size=config.hidden_size,
-            rnn_layers=config.rnn_layers,
-            loss=NormalDistributionLoss(),
-            optimizer="Adam",
-        )
-    else:
-        model = BayesianModel(torch_model, config, device)
-
-        # To enforce all the parameters in the guide on the GPU, since we use an autoguide
-        if device != 'cpu':
-            torch.set_default_tensor_type('torch.cuda.FloatTensor')
-
-        if not config.low_rank:
-            guide = AutoMultivariateNormal(model, init_loc_fn=init_to_mean)
+    if config.esn:
+        if os.path.isfile(file_path):
+            Ytr, train_embedding, Yval, val_embedding, Yte, test_embedding = torch.load(file_path, map_location=torch.device(device))
         else:
-            guide = AutoLowRankMultivariateNormal(model, init_loc_fn=init_to_mean, rank=config.rank)
+            Ytr, train_embedding, Yval, val_embedding, Yte, test_embedding, _, _ = run_esn(config.dataset, device, dim_reduction=config.dim_reduction, config=config)
+            torch.save([Ytr, train_embedding, Yval, val_embedding, Yte, test_embedding], file_path)
+        horizon = None
+    else:
+        # ARIMA
+        if config.inference == "arima":
+            device = torch.device('cpu')
+            train_embedding, Ytr, val_embedding, Yval, test_embedding, Yte, _, _, horizon = dataset_for_arima(config.dataset, device)
+        # DeepAR
+        elif config.inference == "deepar":
+            training, train_embedding, val_embedding, test_embedding, horizon = dataset_for_deepar(config.dataset, config.encoder, config.batch)
+            Ytr, Yval, Yte = None, None, None
+        else:
+            raise ValueError(f"{config.inference} method not implemented.")
 
-    # Perform inference
-    predictive, diagnostics = inference(config, model, guide, 
-                                        X_train=train_embedding, Y_train=Ytr, 
-                                        X_val=val_embedding, Y_val=Yval,
-                                        X_test=test_embedding, Y_test=Yte,
-                                        quantiles=quantiles,
-                                        horizon=horizon,
-                                        device=device)
+
+    # Quantiles
+    quantiles = [0, 0.005]
+    for n in range(39):
+        quantiles.append(0.025*(n+1))
+    quantiles.append(0.995)
 
 
-    train_times.append(diagnostics['train_time'])
-    cal_errors.append(diagnostics['cal_error'])
-    new_cal_errors.append(diagnostics['new_cal_error'])
-    widths.append(diagnostics['width'])
-    new_widths.append(diagnostics['new_width'])
-    crpss.append(diagnostics['crps'])
-    new_crpss.append(diagnostics['new_crps'])
-    mses.append(diagnostics['mse'])
-    new_mses.append(diagnostics['new_mse'])
-    coverages.append(diagnostics['coverage'])
-    new_coverages.append(diagnostics['new_coverage'])
+    train_times = []
+    inf_times = []
+    cal_errors, new_cal_errors = [], []
+    e_crpss = []
+    crpss, new_crpss = [], []
+    losses = []
+    widths, new_widths = [], []
+    mses, new_mses = [], []
+    coverages, new_coverages = [], []
+    grs, effs = [], []
+    sigmas, aleatoric_variances = [], []
+
+    for s in range(config.seed):
+        # Set seed for reproducibility
+        pyro.set_rng_seed(s)
+        np.random.seed(s)
+
+        pyro.clear_param_store()
+
+        torch_model = TorchModel(config.model_widths, config.activation).to(device)
+        guide = None
+        if config.inference == "ssvs":
+            model = HorseshoeSSVS(config.activation, device=device)
+        elif config.inference == "q_regr":
+            model = TorchModel(config.model_widths, config.activation, quantiles=quantiles).to(device)
+        elif config.inference == "dropout":
+            model = TorchModel(config.model_widths, config.activation, dropout=True, p=config.dropout_p).to(device)
+        elif config.inference == "arima":
+            model = None
+        elif config.inference == "deepar":
+            model = DeepAR.from_dataset(
+                training,
+                learning_rate=config.lr,
+                hidden_size=config.hidden_size,
+                rnn_layers=config.rnn_layers,
+                loss=NormalDistributionLoss(),
+                optimizer="Adam",
+            )
+        else:
+            model = BayesianModel(torch_model, config, device)
+
+            # To enforce all the parameters in the guide on the GPU, since we use an autoguide
+            if device != 'cpu':
+                torch.set_default_tensor_type('torch.cuda.FloatTensor')
+
+            if not config.low_rank:
+                guide = AutoMultivariateNormal(model, init_loc_fn=init_to_mean)
+            else:
+                guide = AutoLowRankMultivariateNormal(model, init_loc_fn=init_to_mean, rank=config.rank)
+
+        # Perform inference
+        predictive, diagnostics = inference(config, model, guide,
+                                            X_train=train_embedding, Y_train=Ytr,
+                                            X_val=val_embedding, Y_val=Yval,
+                                            X_test=test_embedding, Y_test=Yte,
+                                            quantiles=quantiles,
+                                            horizon=horizon,
+                                            device=device)
+
+
+        train_times.append(diagnostics['train_time'])
+        cal_errors.append(diagnostics['cal_error'])
+        new_cal_errors.append(diagnostics['new_cal_error'])
+        widths.append(diagnostics['width'])
+        new_widths.append(diagnostics['new_width'])
+        crpss.append(diagnostics['crps'])
+        new_crpss.append(diagnostics['new_crps'])
+        mses.append(diagnostics['mse'])
+        new_mses.append(diagnostics['new_mse'])
+        coverages.append(diagnostics['coverage'])
+        new_coverages.append(diagnostics['new_coverage'])
+
+        if config.inference == "dropout":
+            sigmas.append(diagnostics['sigma'])
+            aleatoric_variances.append(diagnostics['aleatoric_variance'])
+
+        if "final_loss" in diagnostics.keys(): # MCMC doesn't have a loss
+            losses.append(diagnostics['final_loss'])
+        else:
+            losses.append(0)
+
+        if "inference_time" in diagnostics.keys(): # MCMC doesn't have a inference_time
+            inf_times.append(diagnostics['inference_time'])
+        else:
+            inf_times.append(0)
+
+        if "gelman_rubin" in diagnostics.keys(): # only MCMC methods have the gelman rubin factor
+            grs.append(diagnostics['gelman_rubin'])
+        else:
+            grs.append(0)
+
+        if "effective_sample_size" in diagnostics.keys(): # only MCMC methods have the gelman rubin factor
+            effs.append(diagnostics['effective_sample_size'])
+        else:
+            effs.append(0)
+
+
+
+    m_time = np.asarray(train_times).mean()
+    s_time = np.asarray(train_times).std()
+    m_inf_time = np.asarray(inf_times).mean()
+    s_inf_time = np.asarray(inf_times).std()
+    m_cal = np.asarray(cal_errors).mean()
+    s_cal = np.asarray(cal_errors).std()
+    m_new_cal = np.asarray(new_cal_errors).mean()
+    s_new_cal = np.asarray(new_cal_errors).std()
+    m_width = np.asarray(widths).mean()
+    s_width = np.asarray(widths).std()
+    m_new_width = np.asarray(new_widths).mean()
+    s_new_width = np.asarray(new_widths).std()
+    m_crps = np.asarray(crpss).mean()
+    s_crps = np.asarray(crpss).std()
+    m_new_crps = np.asarray(new_crpss).mean()
+    s_new_crps = np.asarray(new_crpss).std()
+    m_mse = np.asarray(mses).mean()
+    s_mse = np.asarray(mses).std()
+    m_new_mse = np.asarray(new_mses).mean()
+    s_new_mse = np.asarray(new_mses).std()
+    m_cov = np.asarray(coverages).mean()
+    s_cov = np.asarray(coverages).std()
+    m_new_cov = np.asarray(new_coverages).mean()
+    s_new_cov = np.asarray(new_coverages).std()
+    m_loss = np.asarray(losses).mean()
+    s_loss = np.asarray(losses).std()
+
+
+    wandb.log({"m_train_time": m_time,
+               "s_train_time": s_time,
+               "m_cal_error": m_cal,
+               "s_cal_error": s_cal,
+               "m_new_cal_error": m_new_cal,
+               "s_new_cal_error": s_new_cal,
+               "m_crps": m_crps,
+               "s_crps": s_crps,
+               "m_new_crps": m_new_crps,
+               "s_new_crps": s_new_crps,
+               "m_mse": m_mse,
+               "s_mse": s_mse,
+               "m_new_mse": m_new_mse,
+               "s_new_mse": s_new_mse,
+               "m_width": m_width,
+               "s_width": s_width,
+               "m_new_width": m_new_width,
+               "s_new_width": s_new_width,
+               "m_cov": m_cov,
+               "s_cov": s_cov,
+               "m_new_cov": m_new_cov,
+               "s_new_cov": s_new_cov,
+               "m_final_loss": m_loss,
+               "s_final_loss": s_loss,
+               "gel_rub": grs,
+               "eff_size": effs})
+
 
     if config.inference == "dropout":
-        sigmas.append(diagnostics['sigma'])
-        aleatoric_variances.append(diagnostics['aleatoric_variance'])
-
-    if "final_loss" in diagnostics.keys(): # MCMC doesn't have a loss
-        losses.append(diagnostics['final_loss'])
-    else:
-        losses.append(0)
-
-    if "inference_time" in diagnostics.keys(): # MCMC doesn't have a inference_time
-        inf_times.append(diagnostics['inference_time'])
-    else:
-        inf_times.append(0)
-
-    if "gelman_rubin" in diagnostics.keys(): # only MCMC methods have the gelman rubin factor
-        grs.append(diagnostics['gelman_rubin'])
-    else:
-        grs.append(0)
-
-    if "effective_sample_size" in diagnostics.keys(): # only MCMC methods have the gelman rubin factor
-        effs.append(diagnostics['effective_sample_size'])
-    else:
-        effs.append(0)
+        wandb.log({"m_sigma": np.mean(sigmas),
+                   "s_sigma": np.std(sigmas),
+                   "m_aleatoric_variance": np.mean(aleatoric_variances),
+                   "s_aleatoric_variance": np.std(aleatoric_variances)})
 
 
+    if config.print_results:
+        df = pd.DataFrame({"seed": range(config.seed), "train_times": train_times, "inf_times": inf_times,
+                           "cal_errors": cal_errors, "new_cal_errors": new_cal_errors,
+                           "coverage": coverages, "new_coverage": new_coverages,
+                           "width": widths, "new_width": new_widths,
+                           "MSE": mses, "new_MSE": new_mses,
+                           "CRPS": crpss, "new_CRPS": new_crpss,
+                           "final_loss": losses})
+        if config.inference == "dropout":
+            df["sigma"] = sigmas
+            df["aleatoric_variance"] = aleatoric_variances
+        with pd.ExcelWriter(f"results/results.xlsx", mode="a", engine="openpyxl", if_sheet_exists="replace") as writer:
+            df.to_excel(writer, sheet_name=f"sheet_{config.dataset}_{config.inference}", index=False)
 
-m_time = np.asarray(train_times).mean()
-s_time = np.asarray(train_times).std()
-m_inf_time = np.asarray(inf_times).mean()
-s_inf_time = np.asarray(inf_times).std()
-m_cal = np.asarray(cal_errors).mean()
-s_cal = np.asarray(cal_errors).std()
-m_new_cal = np.asarray(new_cal_errors).mean()
-s_new_cal = np.asarray(new_cal_errors).std()
-m_width = np.asarray(widths).mean()
-s_width = np.asarray(widths).std()
-m_new_width = np.asarray(new_widths).mean()
-s_new_width = np.asarray(new_widths).std()
-m_crps = np.asarray(crpss).mean()
-s_crps = np.asarray(crpss).std()
-m_new_crps = np.asarray(new_crpss).mean()
-s_new_crps = np.asarray(new_crpss).std()
-m_mse = np.asarray(mses).mean()
-s_mse = np.asarray(mses).std()
-m_new_mse = np.asarray(new_mses).mean()
-s_new_mse = np.asarray(new_mses).std()
-m_cov = np.asarray(coverages).mean()
-s_cov = np.asarray(coverages).std()
-m_new_cov = np.asarray(new_coverages).mean()
-s_new_cov = np.asarray(new_coverages).std()
-m_loss = np.asarray(losses).mean()
-s_loss = np.asarray(losses).std()
+    wandb.finish()
 
 
-wandb.log({"m_train_time": m_time,
-           "s_train_time": s_time,
-           "m_cal_error": m_cal,
-           "s_cal_error": s_cal,
-           "m_new_cal_error": m_new_cal,
-           "s_new_cal_error": s_new_cal,
-           "m_crps": m_crps,
-           "s_crps": s_crps,
-           "m_new_crps": m_new_crps,
-           "s_new_crps": s_new_crps,
-           "m_mse": m_mse,
-           "s_mse": s_mse,
-           "m_new_mse": m_new_mse,
-           "s_new_mse": s_new_mse,
-           "m_width": m_width,
-           "s_width": s_width,
-           "m_new_width": m_new_width,
-           "s_new_width": s_new_width,
-           "m_cov": m_cov,
-           "s_cov": s_cov,
-           "m_new_cov": m_new_cov,
-           "s_new_cov": s_new_cov,
-           "m_final_loss": m_loss,
-           "s_final_loss": s_loss,
-           "gel_rub": grs,
-           "eff_size": effs})
-
-
-if config.inference == "dropout":
-    wandb.log({"m_sigma": np.mean(sigmas),
-               "s_sigma": np.std(sigmas),
-               "m_aleatoric_variance": np.mean(aleatoric_variances),
-               "s_aleatoric_variance": np.std(aleatoric_variances)})
-
-
-if config.print_results:
-    df = pd.DataFrame({"seed": range(config.seed), "train_times": train_times, "inf_times": inf_times,
-                       "cal_errors": cal_errors, "new_cal_errors": new_cal_errors,
-                       "coverage": coverages, "new_coverage": new_coverages,
-                       "width": widths, "new_width": new_widths,
-                       "MSE": mses, "new_MSE": new_mses,
-                       "CRPS": crpss, "new_CRPS": new_crpss,
-                       "final_loss": losses})
-    if config.inference == "dropout":
-        df["sigma"] = sigmas
-        df["aleatoric_variance"] = aleatoric_variances
-    with pd.ExcelWriter(f"results/results.xlsx", mode="a", engine="openpyxl", if_sheet_exists="replace") as writer:
-        df.to_excel(writer, sheet_name=f"sheet_{config.dataset}_{config.inference}", index=False) 
+if __name__ == "__main__":
+    main()

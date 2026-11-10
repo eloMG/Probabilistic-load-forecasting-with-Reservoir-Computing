@@ -1,0 +1,5 @@
+# @package _global_
+
+inference: dropout
+esn: true
+dropout_p: 0.2

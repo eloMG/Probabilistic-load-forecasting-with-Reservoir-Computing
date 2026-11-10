@@ -1,11 +1,11 @@
-import json
 import ESN.esnet as esnet
 
 from torch import from_numpy
+from omegaconf import OmegaConf
 from dataset.data_loaders import load_dataset, generate_datasets
 
 
-def run_esn(dataset, device, dim_reduction=True):
+def run_esn(dataset, device, dim_reduction=True, config=None):
     """
     Run ESN and returns either the reservoir states, or the embeddings produce by dimensionality reduction
     """
@@ -13,7 +13,8 @@ def run_esn(dataset, device, dim_reduction=True):
     data, L, F = load_dataset(dataset)
 
     # Set ESN hyperparams
-    config = json.load(open('ESN/configs/ESN_hyperparams.json', 'r'))
+    if config is None:
+        config = OmegaConf.load('config/esn/default.yaml')
 
     Xtr, Ytr, Xval, Yval, Xte, Yte, diffXte, diffYte = generate_datasets(data, L, F, test_percent = 0.25, val_percent = 0.25)
     print("Tr: {:d}, Val: {:d}, Te: {:d}".format(Xtr.shape[0], Xval.shape[0], Xte.shape[0]))

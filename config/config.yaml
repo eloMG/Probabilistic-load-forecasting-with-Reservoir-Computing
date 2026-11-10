@@ -1,0 +1,21 @@
+defaults:
+  - _self_
+  - esn: default
+  - bayesian: default
+  - method: deepar
+
+dataset: acea
+model_widths: [512, 1]
+activation: relu
+num_samples: 8000
+lr: 0.03
+num_iterations: 2000
+plot: false
+seed: 10
+print_results: true
+sweep: true
+
+# Keep the existing relative dataset, checkpoint and result paths.
+hydra:
+  job:
+    chdir: false

@@ -1,0 +1,4 @@
+# @package _global_
+
+inference: q_regr
+esn: true

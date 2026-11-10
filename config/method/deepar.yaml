@@ -1,0 +1,8 @@
+# @package _global_
+
+inference: deepar
+esn: false
+hidden_size: 32
+rnn_layers: 2
+encoder: 10
+batch: 64
