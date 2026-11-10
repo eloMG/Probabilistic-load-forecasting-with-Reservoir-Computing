@@ -298,7 +298,7 @@ def train_DO(model, X, Y, X_val, Y_val, lr, epochs):
 
             # Early stopping
             model.eval()
-            valid_loss = mse_loss(model(X_val), Y_val).item()
+            valid_loss = mse_loss(model(X_val).squeeze(-1), Y_val).item()
 
             # early_stopping needs the validation loss to check if it has decresed, 
             # and if it has, it will make a checkpoint of the current model
