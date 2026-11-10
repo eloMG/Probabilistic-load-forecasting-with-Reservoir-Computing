@@ -114,7 +114,7 @@ def pred_SVI(model, guide, X_val, Y_val, X_cal, Y_cal, X_test, Y_test, num_sampl
     diagnostics["crps"] = n_crps
     # Compute CRPS after calibration
     tau = np.quantile(predictive["obs"].cpu().numpy().squeeze(), new_quantiles, axis=0)
-    new_n_crps = num_eval_crps(new_quantiles, tau, Y.cpu().squeeze().numpy())
+    new_n_crps = num_eval_crps(quantiles, tau, Y.cpu().squeeze().numpy())
     diagnostics["new_crps"] = new_n_crps
 
     return predictive, diagnostics
@@ -263,7 +263,7 @@ def pred_MCMC(model, samples, X_val, Y_val, X_cal, Y_cal, X_test, Y_test, plot, 
     diagnostics["crps"] = n_crps
     # Compute CRPS after calibration
     tau = np.quantile(predictive["obs"].cpu().numpy().squeeze(), new_quantiles, axis=0)
-    new_n_crps = num_eval_crps(new_quantiles, tau, Y.cpu().squeeze().numpy())
+    new_n_crps = num_eval_crps(quantiles, tau, Y.cpu().squeeze().numpy())
     diagnostics["new_crps"] = new_n_crps
 
     return predictive, diagnostics
@@ -443,7 +443,7 @@ def pred_DO(model, X_val, Y_val, X_cal, Y_cal, X_test, Y_test, num_samples, plot
     diagnostics["crps"] = n_crps
     # Compute CRPS after calibration
     tau = np.quantile(predictive, new_quantiles, axis=0)
-    new_n_crps = num_eval_crps(new_quantiles, tau, Y.cpu().squeeze().numpy())
+    new_n_crps = num_eval_crps(quantiles, tau, Y.cpu().squeeze().numpy())
     diagnostics["new_crps"] = new_n_crps
 
     predictive_dict = {"obs": torch.from_numpy(predictive)}
@@ -568,7 +568,7 @@ def pred_deepAR(model, val_dataloader, cal_dataloader, test_dataloader, num_samp
     diagnostics["crps"] = n_crps
     # Compute CRPS after calibration
     tau = np.quantile(predictive_dict["obs"].cpu().numpy().squeeze(), new_quantiles, axis=0)
-    new_n_crps = num_eval_crps(new_quantiles, tau, Y.cpu().squeeze().numpy())
+    new_n_crps = num_eval_crps(quantiles, tau, Y.cpu().squeeze().numpy())
     diagnostics["new_crps"] = new_n_crps
 
     return predictive_dict, diagnostics
