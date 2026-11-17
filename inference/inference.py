@@ -23,7 +23,8 @@ def inference(config, model, guide, X_train, Y_train, X_val, Y_val, X_test, Y_te
         return predictive, diagnostics
     
     elif config.inference == "dropout":
-        diagnostics = train_DO(model, X_train, Y_train, X_val, Y_val, config.lr, config.num_iterations)
+        diagnostics = train_DO(model, X_train, Y_train, X_val, Y_val, config.lr, config.num_iterations,
+                               weight_decay=config.get("dropout_weight_decay", 1e-5))
         predictive, diagnostics = pred_DO(model, X_val, Y_val, X_cal, Y_cal, X_test, Y_test, config.num_samples, config.plot, config.sweep, diagnostics, quantiles)
         return predictive, diagnostics
 

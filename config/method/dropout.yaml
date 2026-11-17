@@ -3,3 +3,4 @@
 inference: dropout
 esn: true
 dropout_p: 0.2
+dropout_weight_decay: 1.0e-5

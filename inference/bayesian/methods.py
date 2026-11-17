@@ -275,9 +275,9 @@ def pred_MCMC(model, samples, X_val, Y_val, X_cal, Y_cal, X_test, Y_test, plot, 
 ########################
 
 
-def train_DO(model, X, Y, X_val, Y_val, lr, epochs):
+def train_DO(model, X, Y, X_val, Y_val, lr, epochs, weight_decay=1e-5):
 
-    torch_optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    torch_optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     mse_loss = torch.nn.MSELoss()
 
     # initialize the early_stopping object
