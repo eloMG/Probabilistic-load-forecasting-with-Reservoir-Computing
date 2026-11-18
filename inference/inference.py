@@ -3,12 +3,13 @@ from inference.frequentist.methods import train_QR, pred_QR, train_ARIMA, pred_A
 from dataset.data_loaders import split_validation
 
 
-def inference(config, model, guide, X_train, Y_train, X_val, Y_val, X_test, Y_test, quantiles=None, horizon=None, device=None):
+def inference(config, model, guide, X_train, Y_train, X_val, Y_val, X_test, Y_test, quantiles=None, horizon=None, device=None, loss_callback=None):
     # Preserve the original training/test sets and split the old validation period.
     X_val, Y_val, X_cal, Y_cal = split_validation(X_val, Y_val)
 
     if config.inference == "svi":
-        diagnostics = train_SVI(model, guide, X_train, Y_train, config.lr, config.num_iterations)
+        diagnostics = train_SVI(model, guide, X_train, Y_train, config.lr, config.num_iterations,
+                                X_val=X_val, Y_val=Y_val, loss_callback=loss_callback)
         predictive, diagnostics = pred_SVI(model, guide, X_val, Y_val, X_cal, Y_cal, X_test, Y_test, config.num_samples, config.plot, config.sweep, diagnostics, quantiles)
         return predictive, diagnostics
 
@@ -18,13 +19,15 @@ def inference(config, model, guide, X_train, Y_train, X_val, Y_val, X_test, Y_te
         return predictive, diagnostics
 
     elif config.inference == "q_regr":
-        diagnostics = train_QR(model, X_train, Y_train, X_val, Y_val, config.lr, config.num_iterations, quantiles)
+        diagnostics = train_QR(model, X_train, Y_train, X_val, Y_val, config.lr, config.num_iterations, quantiles,
+                               loss_callback=loss_callback)
         predictive, diagnostics = pred_QR(model, X_val, Y_val, X_cal, Y_cal, X_test, Y_test, config.plot, config.sweep, diagnostics, quantiles)
         return predictive, diagnostics
     
     elif config.inference == "dropout":
         diagnostics = train_DO(model, X_train, Y_train, X_val, Y_val, config.lr, config.num_iterations,
-                               weight_decay=config.get("dropout_weight_decay", 1e-5))
+                               weight_decay=config.get("dropout_weight_decay", 1e-5),
+                               loss_callback=loss_callback)
         predictive, diagnostics = pred_DO(model, X_val, Y_val, X_cal, Y_cal, X_test, Y_test, config.num_samples, config.plot, config.sweep, diagnostics, quantiles)
         return predictive, diagnostics
 
@@ -34,7 +37,8 @@ def inference(config, model, guide, X_train, Y_train, X_val, Y_val, X_test, Y_te
         return predictive, diagnostics
 
     elif config.inference == "deepar":
-        model, diagnostics = train_deepAR(model, X_train, X_val, config.num_iterations, device)
+        model, diagnostics = train_deepAR(model, X_train, X_val, config.num_iterations, device,
+                                          loss_callback=loss_callback)
         predictive, diagnostics = pred_deepAR(model, X_val, X_cal, X_test, config.num_samples, horizon, config.plot, config.sweep, diagnostics, quantiles, device)
         return predictive, diagnostics
 

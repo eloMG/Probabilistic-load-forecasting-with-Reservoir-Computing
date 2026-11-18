@@ -16,7 +16,7 @@ from ESN.utils import to_torch
 ####################################
 
 
-def train_QR(model, X, Y, X_val, Y_val, lr, epochs, quantiles):
+def train_QR(model, X, Y, X_val, Y_val, lr, epochs, quantiles, loss_callback=None):
 
     torch_optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
 
@@ -36,11 +36,15 @@ def train_QR(model, X, Y, X_val, Y_val, lr, epochs, quantiles):
 
             # display progress bar
             t.set_description(f"Epoch {epoch+1}")
-            t.set_postfix({"loss":float(loss / Y.shape[0])})
+            train_loss = loss.detach().item() / Y.shape[0]
+            t.set_postfix({"loss": train_loss})
 
             # Early stopping
             model.eval()
-            valid_loss = quantile_loss(quantiles, model(X_val), Y_val).item()
+            with torch.no_grad():
+                valid_loss = quantile_loss(quantiles, model(X_val), Y_val).item()
+            if loss_callback is not None:
+                loss_callback(epoch + 1, train_loss, valid_loss / Y_val.shape[0])
 
             # early_stopping needs the validation loss to check if it has decresed, 
             # and if it has, it will make a checkpoint of the current model
@@ -57,7 +61,7 @@ def train_QR(model, X, Y, X_val, Y_val, lr, epochs, quantiles):
 
     diagnostics = {
         "train_time": train_time,
-        "final_loss": float((loss / Y.shape[0]).detach().cpu())
+        "final_loss": train_loss
     }
 
     return diagnostics

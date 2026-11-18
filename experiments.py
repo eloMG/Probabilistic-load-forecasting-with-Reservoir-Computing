@@ -20,6 +20,25 @@ from dataset.data_loaders import dataset_for_arima, dataset_for_deepar
 
 warnings.simplefilter("ignore", UserWarning)
 
+
+def training_logger(method, seed):
+    """Create per-seed loss curves only for methods with a training loss."""
+    if method not in ("dropout", "svi", "q_regr", "deepar"):
+        return None
+    prefix = f"{method}/seed_{seed}"
+    wandb.define_metric(f"{prefix}/epoch")
+    wandb.define_metric(f"{prefix}/train_loss", step_metric=f"{prefix}/epoch")
+    wandb.define_metric(f"{prefix}/val_loss", step_metric=f"{prefix}/epoch")
+
+    def loss_callback(epoch, train_loss, val_loss):
+        metrics = {f"{prefix}/epoch": epoch, f"{prefix}/train_loss": train_loss}
+        if val_loss is not None:
+            metrics[f"{prefix}/val_loss"] = val_loss
+        wandb.log(metrics)
+
+    return loss_callback
+
+
 @hydra.main(version_base="1.3", config_path="config", config_name="config")
 def main(config: DictConfig):
     os.environ["WANDB_MODE"]="online" if config['sweep'] else "offline"
@@ -117,6 +136,8 @@ def main(config: DictConfig):
             else:
                 guide = AutoLowRankMultivariateNormal(model, init_loc_fn=init_to_mean, rank=config.rank)
 
+        loss_callback = training_logger(config.inference, s)
+
         # Perform inference
         predictive, diagnostics = inference(config, model, guide,
                                             X_train=train_embedding, Y_train=Ytr,
@@ -124,7 +145,8 @@ def main(config: DictConfig):
                                             X_test=test_embedding, Y_test=Yte,
                                             quantiles=quantiles,
                                             horizon=horizon,
-                                            device=device)
+                                            device=device,
+                                            loss_callback=loss_callback)
 
 
         train_times.append(diagnostics['train_time'])
@@ -215,10 +237,11 @@ def main(config: DictConfig):
                "s_cov": s_cov,
                "m_new_cov": m_new_cov,
                "s_new_cov": s_new_cov,
-               "m_final_loss": m_loss,
-               "s_final_loss": s_loss,
                "gel_rub": grs,
                "eff_size": effs})
+
+    if config.inference in ("dropout", "svi", "q_regr", "deepar"):
+        wandb.log({"m_final_loss": m_loss, "s_final_loss": s_loss})
 
 
     if config.inference == "dropout":
