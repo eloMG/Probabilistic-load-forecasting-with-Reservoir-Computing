@@ -1,0 +1,9 @@
+# @package _global_
+
+inference: arima
+esn: false
+start_p: 1
+start_q: 1
+max_p: 32
+max_q: 32
+d: 1

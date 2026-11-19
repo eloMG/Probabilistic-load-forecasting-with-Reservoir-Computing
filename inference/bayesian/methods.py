@@ -4,6 +4,8 @@ import numpy as np
 import lightning.pytorch as pl
 
 from time import process_time
+from scipy.optimize import minimize_scalar
+from scipy.special import logsumexp
 from pyro import clear_param_store
 from pyro.optim import Adam
 from pyro.infer import SVI, Trace_ELBO, Predictive, MCMC, NUTS
@@ -11,7 +13,7 @@ from pyro.ops.stats import autocorrelation
 from pyro.contrib.forecast.evaluate import eval_crps
 from tqdm import trange
 from pytorch_forecasting import DeepAR
-from pytorch_lightning.loggers import TensorBoardLogger
+from lightning.pytorch.loggers import TensorBoardLogger
 
 from inference.bayesian.utils import check_convergence, acceptance_rate, calibrate, compute_coverage_len, num_eval_crps
 from inference.early_stopping import EarlyStopping
@@ -22,7 +24,8 @@ from inference.early_stopping import EarlyStopping
 #           Variational Inference       #
 #########################################
 
-def train_SVI(model, guide, X, Y, lr=0.03, num_iterations=120):
+def train_SVI(model, guide, X, Y, lr=0.03, num_iterations=120,
+              X_val=None, Y_val=None, loss_callback=None):
     
     optim = Adam({"lr": lr})
     svi = SVI(model, guide, optim, loss=Trace_ELBO())
@@ -41,6 +44,15 @@ def train_SVI(model, guide, X, Y, lr=0.03, num_iterations=120):
             t.set_description(f"Epoch {j+1}")
             t.set_postfix({"loss":loss / Y.shape[0]})
 
+            if loss_callback is not None:
+                valid_loss = None
+                if X_val is not None and Y_val is not None:
+                    # Validation sampling must not alter subsequent training draws.
+                    devices = [X.device.index] if X.is_cuda else []
+                    with torch.random.fork_rng(devices=devices), torch.no_grad():
+                        valid_loss = svi.evaluate_loss(X_val, Y_val) / Y_val.shape[0]
+                loss_callback(j + 1, loss / Y.shape[0], valid_loss)
+
     train_time = process_time() - start_time
 
     guide.requires_grad_(False)
@@ -53,15 +65,14 @@ def train_SVI(model, guide, X, Y, lr=0.03, num_iterations=120):
     return diagnostics
 
 
-def pred_SVI(model, guide, X_val, Y_val, X_test, Y_test, num_samples, plot, sweep, diagnostics, quantiles):
+def pred_SVI(model, guide, X_val, Y_val, X_cal, Y_cal, X_test, Y_test, num_samples, plot, sweep, diagnostics, quantiles):
 
     # Use validation set for hyperparameters tuning
     if sweep:
         X, Y = X_val, Y_val
-        X2, Y2 = X_test, Y_test
     else:
         X, Y = X_test, Y_test
-        X2, Y2 = X_val, Y_val
+    X2, Y2 = X_cal, Y_cal
 
     # Perform inference
     start_time = process_time()
@@ -70,11 +81,13 @@ def pred_SVI(model, guide, X_val, Y_val, X_test, Y_test, num_samples, plot, swee
     diagnostics["inference_time"] = inference_time
 
     # Compute calibration error
-    predictive2 = Predictive(model, guide=guide, num_samples=num_samples)(x=X2, y=None)
+    predictive2 = None
+    if not sweep:
+        predictive2 = Predictive(model, guide=guide, num_samples=num_samples)(x=X2, y=None)["obs"].cpu().numpy().squeeze()
     # Calibrate
     cal_error, new_cal_error, new_quantiles = calibrate(predictive["obs"].cpu().numpy().squeeze(), 
-                                                        predictive2["obs"].cpu().numpy().squeeze(), 
-                                                        Y, Y2, quantiles, folder="svi", plot=plot)
+                                                        predictive2,
+                                                        Y, Y2, quantiles, folder="svi", plot=plot, recalibrate=not sweep)
     diagnostics["cal_error"] = cal_error
     diagnostics["new_cal_error"] = new_cal_error
     diagnostics["quantiles"] = quantiles
@@ -111,7 +124,7 @@ def pred_SVI(model, guide, X_val, Y_val, X_test, Y_test, num_samples, plot, swee
     diagnostics["crps"] = n_crps
     # Compute CRPS after calibration
     tau = np.quantile(predictive["obs"].cpu().numpy().squeeze(), new_quantiles, axis=0)
-    new_n_crps = num_eval_crps(new_quantiles, tau, Y.cpu().squeeze().numpy())
+    new_n_crps = num_eval_crps(quantiles, tau, Y.cpu().squeeze().numpy())
     diagnostics["new_crps"] = new_n_crps
 
     return predictive, diagnostics
@@ -179,15 +192,14 @@ def train_MCMC(model, X, Y, num_chains, num_samples, sweep):
     return samples, diagnostics
 
 
-def pred_MCMC(model, samples, X_val, Y_val, X_test, Y_test, plot, sweep, diagnostics, inference_name, quantiles):
+def pred_MCMC(model, samples, X_val, Y_val, X_cal, Y_cal, X_test, Y_test, plot, sweep, diagnostics, inference_name, quantiles):
 
     # Use validation set for hyperparameters tuning
     if sweep:
         X, Y = X_val, Y_val
-        X2, Y2 = X_test, Y_test
     else:
         X, Y = X_test, Y_test
-        X2, Y2 = X_val, Y_val
+    X2, Y2 = X_cal, Y_cal
 
     # Find when it converged
     acc_rate = diagnostics["acceptance_rate"]
@@ -215,11 +227,13 @@ def pred_MCMC(model, samples, X_val, Y_val, X_test, Y_test, plot, sweep, diagnos
     diagnostics["mse"] = mse
 
     # Compute calibration error
-    predictive2 = Predictive(model, samples)(x=X2, y=None)
+    predictive2 = None
+    if not sweep:
+        predictive2 = Predictive(model, samples)(x=X2, y=None)["obs"].cpu().numpy().squeeze()
     # Calibrate
     cal_error, new_cal_error, new_quantiles = calibrate(predictive["obs"].cpu().numpy().squeeze(), 
-                                                        predictive2["obs"].cpu().numpy().squeeze(), 
-                                                        Y, Y2, quantiles, folder=inference_name, plot=plot)
+                                                        predictive2,
+                                                        Y, Y2, quantiles, folder=inference_name, plot=plot, recalibrate=not sweep)
     diagnostics["cal_error"] = cal_error
     diagnostics["new_cal_error"] = new_cal_error
     diagnostics["quantiles"] = quantiles
@@ -259,7 +273,7 @@ def pred_MCMC(model, samples, X_val, Y_val, X_test, Y_test, plot, sweep, diagnos
     diagnostics["crps"] = n_crps
     # Compute CRPS after calibration
     tau = np.quantile(predictive["obs"].cpu().numpy().squeeze(), new_quantiles, axis=0)
-    new_n_crps = num_eval_crps(new_quantiles, tau, Y.cpu().squeeze().numpy())
+    new_n_crps = num_eval_crps(quantiles, tau, Y.cpu().squeeze().numpy())
     diagnostics["new_crps"] = new_n_crps
 
     return predictive, diagnostics
@@ -271,9 +285,10 @@ def pred_MCMC(model, samples, X_val, Y_val, X_test, Y_test, plot, sweep, diagnos
 ########################
 
 
-def train_DO(model, X, Y, X_val, Y_val, lr, epochs):
+def train_DO(model, X, Y, X_val, Y_val, lr, epochs, weight_decay=1e-5, loss_callback=None):
+    """Train dropout; optionally report (epoch, train MSE, validation MSE)."""
 
-    torch_optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    torch_optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     mse_loss = torch.nn.MSELoss()
 
     # initialize the early_stopping object
@@ -292,11 +307,16 @@ def train_DO(model, X, Y, X_val, Y_val, lr, epochs):
 
             # display progress bar
             t.set_description(f"Epoch {epoch+1}")
-            t.set_postfix({"loss":float(loss / Y.shape[0])})
+            train_loss = loss.detach().item()
+            t.set_postfix({"loss": train_loss})
 
             # Early stopping
             model.eval()
-            valid_loss = mse_loss(model(X_val), Y_val).item()
+            with torch.no_grad():
+                valid_loss = mse_loss(model(X_val).squeeze(-1), Y_val).item()
+
+            if loss_callback is not None:
+                loss_callback(epoch + 1, train_loss, valid_loss)
 
             # early_stopping needs the validation loss to check if it has decresed, 
             # and if it has, it will make a checkpoint of the current model
@@ -315,39 +335,75 @@ def train_DO(model, X, Y, X_val, Y_val, lr, epochs):
 
     diagnostics = {
         "train_time": train_time,
-        "final_loss": float((loss / Y.shape[0]).detach().cpu())
+        "final_loss": train_loss
     }
 
     return diagnostics
 
 
-def pred_DO(model, X_val, Y_val, X_test, Y_test, num_samples, plot, sweep, diagnostics, quantiles):
+def estimate_DO_sigma(predictive, Y):
+    """Fit Gaussian observation noise using fixed validation dropout predictions."""
+
+    squared_error = (Y.detach().cpu().numpy().reshape(-1) - predictive)**2
+
+    def neg_log_likelihood(log_sigma):
+        sigma = np.exp(log_sigma)
+        log_prob = -0.5 * squared_error / sigma**2 - log_sigma - 0.5 * np.log(2 * np.pi)
+        return -np.mean(logsumexp(log_prob, axis=0) - np.log(predictive.shape[0]))
+
+    # Targets are standardized; optimize log(sigma) to keep sigma positive.
+    result = minimize_scalar(neg_log_likelihood, bounds=(-10, 10), method="bounded")
+    return np.exp(result.x)
+
+
+def pred_DO(model, X_val, Y_val, X_cal, Y_cal, X_test, Y_test, num_samples, plot, sweep, diagnostics, quantiles):
+
+    model.train() # keep dropout active during prediction
+
+    start_time = process_time()
+    val_predictive = []
+    with torch.no_grad():
+        for n in range(num_samples):
+            val_predictive.append(model(X_val).cpu().squeeze(-1).numpy())
+    val_predictive = np.stack(val_predictive, axis=0)
+    sigma = estimate_DO_sigma(val_predictive, Y_val)
+    diagnostics["sigma"] = sigma
+    diagnostics["aleatoric_variance"] = sigma**2
 
     # Use validation set for hyperparameters tuning
     if sweep:
         X, Y = X_val, Y_val
-        X2, Y2 = X_test, Y_test
     else:
         X, Y = X_test, Y_test
-        X2, Y2 = X_val, Y_val
+    X2, Y2 = X_cal, Y_cal
 
     # Perform inference
-    start_time = process_time()
-    predictive = []
-    for n in range(num_samples):
-        predictive.append(model(X).detach().cpu().squeeze())
-    predictive = np.stack(predictive, axis=0)
+    predictive = val_predictive
+    if not sweep:
+        predictive = []
+        with torch.no_grad():
+            for n in range(num_samples):
+                predictive.append(model(X).cpu().squeeze(-1).numpy())
+        predictive = np.stack(predictive, axis=0)
     inference_time = process_time() - start_time
     diagnostics["inference_time"] = inference_time
 
     # Compute calibration error
-    predictive2 = []
-    for n in range(num_samples):
-        predictive2.append(model(X2).detach().cpu().squeeze())
-    predictive2 = np.stack(predictive2, axis=0)
+    predictive2 = None
+    if not sweep:
+        predictive2 = []
+        with torch.no_grad():
+            for n in range(num_samples):
+                predictive2.append(model(X2).cpu().squeeze(-1).numpy())
+        predictive2 = np.stack(predictive2, axis=0)
+
+    # Observation samples include both epistemic and aleatoric uncertainty.
+    predictive = predictive + np.random.normal(0, sigma, size=predictive.shape)
+    if not sweep:
+        predictive2 = predictive2 + np.random.normal(0, sigma, size=predictive2.shape)
 
     # Calibrate
-    cal_error, new_cal_error, new_quantiles = calibrate(predictive, predictive2, Y, Y2, quantiles, folder="dropout", plot=plot)
+    cal_error, new_cal_error, new_quantiles = calibrate(predictive, predictive2, Y, Y2, quantiles, folder="dropout", plot=plot, recalibrate=not sweep)
     diagnostics["cal_error"] = cal_error
     diagnostics["new_cal_error"] = new_cal_error
     diagnostics["quantiles"] = quantiles
@@ -403,7 +459,7 @@ def pred_DO(model, X_val, Y_val, X_test, Y_test, num_samples, plot, sweep, diagn
     diagnostics["crps"] = n_crps
     # Compute CRPS after calibration
     tau = np.quantile(predictive, new_quantiles, axis=0)
-    new_n_crps = num_eval_crps(new_quantiles, tau, Y.cpu().squeeze().numpy())
+    new_n_crps = num_eval_crps(quantiles, tau, Y.cpu().squeeze().numpy())
     diagnostics["new_crps"] = new_n_crps
 
     predictive_dict = {"obs": torch.from_numpy(predictive)}
@@ -417,7 +473,25 @@ def pred_DO(model, X_val, Y_val, X_test, Y_test, num_samples, plot, sweep, diagn
 #########################################
 
 
-def train_deepAR(model, train_dataloader, val_dataloader, epochs, device):
+class DeepARLossLogger(pl.Callback):
+    """Forward Lightning's epoch-aggregated losses to the experiment logger."""
+
+    def __init__(self, loss_callback=None):
+        self.loss_callback = loss_callback
+        self.final_loss = np.nan
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        metrics = trainer.callback_metrics
+        train_loss = metrics.get("train_loss_epoch", metrics.get("train_loss"))
+        val_loss = metrics.get("val_loss")
+        if train_loss is not None:
+            self.final_loss = float(train_loss.detach().cpu())
+            if self.loss_callback is not None:
+                self.loss_callback(trainer.current_epoch + 1, self.final_loss,
+                                   None if val_loss is None else float(val_loss.detach().cpu()))
+
+
+def train_deepAR(model, train_dataloader, val_dataloader, epochs, device, loss_callback=None):
 
     accelerator = "gpu" if device.type == "cuda" else "cpu"
     model = model.to(device)
@@ -427,13 +501,14 @@ def train_deepAR(model, train_dataloader, val_dataloader, epochs, device):
         verbose=False, mode="min")
  
     logger = TensorBoardLogger("logs", "DeepAR")   
+    loss_logger = DeepARLossLogger(loss_callback)
     
     trainer = pl.Trainer(
         max_epochs=epochs,
         accelerator=accelerator,
         enable_model_summary=True,
         gradient_clip_val=0.2,
-        callbacks=[early_stop_callback],
+        callbacks=[early_stop_callback, loss_logger],
         limit_train_batches=50,
         enable_checkpointing=True,  
         logger=logger
@@ -452,13 +527,13 @@ def train_deepAR(model, train_dataloader, val_dataloader, epochs, device):
 
     diagnostics = {
         "train_time": train_time,
-        "final_loss": np.nan
+        "final_loss": loss_logger.final_loss
     }
 
     return best_model, diagnostics
     
 
-def pred_deepAR(model, val_dataloader, test_dataloader, num_samples, horizon, plot, sweep, diagnostics, quantiles, device):
+def pred_deepAR(model, val_dataloader, cal_dataloader, test_dataloader, num_samples, horizon, plot, sweep, diagnostics, quantiles, device):
     
     accelerator = "cuda" if device.type == "cuda" else "cpu"
     model = model.to(device)
@@ -466,10 +541,9 @@ def pred_deepAR(model, val_dataloader, test_dataloader, num_samples, horizon, pl
     # Use validation set for hyperparameters tuning
     if sweep:
         dataloader1 = val_dataloader
-        dataloader2 = test_dataloader
     else:
         dataloader1 = test_dataloader
-        dataloader2 = val_dataloader
+    dataloader2 = cal_dataloader
     
     # Perform inference
     start_time = process_time()
@@ -483,14 +557,16 @@ def pred_deepAR(model, val_dataloader, test_dataloader, num_samples, horizon, pl
     predictive_dict = {"obs": predictive, "y": Y}
 
     # Compute calibration error
-    predictive2 = model.predict(dataloader2, mode="raw", return_x=False, n_samples=num_samples, 
-                               trainer_kwargs=dict(accelerator=accelerator), return_y=True)
-    Y2 = predictive2.y[0][0,horizon-1::horizon]
-    predictive2 = predictive2.output["prediction"][:,-1,:].T
+    predictive2, Y2 = None, None
+    if not sweep:
+        predictive2 = model.predict(dataloader2, mode="raw", return_x=False, n_samples=num_samples,
+                                   trainer_kwargs=dict(accelerator=accelerator), return_y=True)
+        Y2 = predictive2.y[0][0,horizon-1::horizon]
+        predictive2 = predictive2.output["prediction"][:,-1,:].T.cpu().numpy().squeeze()
     # Calibrate
     cal_error, new_cal_error, new_quantiles = calibrate(predictive.cpu().numpy().squeeze(), 
-                                                        predictive2.cpu().numpy().squeeze(), 
-                                                        Y, Y2, quantiles, folder="deepar", plot=plot)
+                                                        predictive2,
+                                                        Y, Y2, quantiles, folder="deepar", plot=plot, recalibrate=not sweep)
     diagnostics["cal_error"] = cal_error
     diagnostics["new_cal_error"] = new_cal_error
     diagnostics["quantiles"] = quantiles
@@ -527,7 +603,7 @@ def pred_deepAR(model, val_dataloader, test_dataloader, num_samples, horizon, pl
     diagnostics["crps"] = n_crps
     # Compute CRPS after calibration
     tau = np.quantile(predictive_dict["obs"].cpu().numpy().squeeze(), new_quantiles, axis=0)
-    new_n_crps = num_eval_crps(new_quantiles, tau, Y.cpu().squeeze().numpy())
+    new_n_crps = num_eval_crps(quantiles, tau, Y.cpu().squeeze().numpy())
     diagnostics["new_crps"] = new_n_crps
 
     return predictive_dict, diagnostics

@@ -60,15 +60,17 @@ def check_calibration(predictive, Y, quantiles):
     return cal_error, predicted_cdf
 
 
-def calibrate(predictive, predictive2, Y, Y2, quantiles, folder, plot=False):
+def calibrate(predictive, predictive2, Y, Y2, quantiles, folder, plot=False, recalibrate=True):
     """
-    Function that computes the calibration error on the test dataset,
-    train a calibrator on the evaluation dataset and check again the 
-    error on test dataset (or vice versa)
+    Score the first dataset and fit recalibration on the second dataset.
+    During tuning, skip recalibration and return the original quantile levels.
     """
 
     # Check calibration on first dataset
     cal_error, unc_cdf = check_calibration(predictive, Y, quantiles)
+
+    if not recalibrate:
+        return cal_error, cal_error, quantiles
 
     # Calibrate on second dataset
     # Fit calibrator

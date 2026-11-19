@@ -12,3 +12,5 @@ ESN/saved/
 checkpoints/
 lightning_logs/
 logs/
+outputs/
+multirun/

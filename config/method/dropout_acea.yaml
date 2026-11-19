@@ -1,0 +1,9 @@
+# @package _global_
+inference: dropout
+esn: true
+
+dropout_p: 0.6735243306177828
+dropout_weight_decay: 0
+model_widths: [512, 256, 128, 1]
+activation: tanh
+lr: 0.00010910035997013356

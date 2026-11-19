@@ -1,0 +1,9 @@
+# @package _global_
+inference: dropout
+esn: true
+
+dropout_p: 0.4349434877564662
+dropout_weight_decay: 0.001
+model_widths: [512, 512, 1]
+activation: relu
+lr: 0.001483504450446301

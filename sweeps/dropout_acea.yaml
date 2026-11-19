@@ -1,0 +1,65 @@
+# W&B sweep config, separate from the Hydra configs in config/.
+# Run agents sequentially: dropout training shares checkpoints/DO/checkpoint.pt.
+program: experiments.py
+project: bayes_rc
+name: dropout-acea
+method: bayes
+metric:
+  name: m_crps
+  goal: minimize
+
+# Hydra expects key=value arguments rather than --key=value.
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - method=dropout
+  - esn=default
+  - ${args_no_hyphens}
+
+parameters:
+  dataset:
+    value: acea
+  sweep:
+    value: true
+  print_results:
+    value: false
+  plot:
+    value: false
+
+  # Fixed reservoir; reuse the existing cached states.
+  n_internal_units:
+    value: 512
+  dim_reduction:
+    value: false
+
+  # Equal training/evaluation budgets across trials.
+  # seed is a repetition count: 5 runs seeds 0, 1, 2, 3, and 4.
+  seed:
+    value: 5
+  num_iterations:
+    value: 2000
+  num_samples:
+    value: 1000
+
+  dropout_p:
+    distribution: uniform
+    min: 0.0
+    max: 0.7
+  lr:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.03
+  dropout_weight_decay:
+    values: [0.0, 0.000001, 0.00001, 0.0001, 0.001]
+  model_widths:
+    values:
+      - [512, 1]
+      - [512, 64, 1]
+      - [512, 128, 1]
+      - [512, 256, 1]
+      - [512, 512, 1]
+      - [512, 256, 128, 1]
+  # Activation has no effect on the linear [512, 1] readout.
+  activation:
+    values: [relu, tanh]
